@@ -1,196 +1,219 @@
-// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, { cors: { origin: '*' } });
 
-const PORT = process.env.PORT || 10000;
-const COLORS = ['red','green','blue','yellow'];
-const MAX_CARDS_LOSE = 35;
+const PORT = process.env.PORT || 3000;
 
-function cryptoId(){ return Math.random().toString(36).slice(2,10); }
-function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]] } return a; }
-
-function makeDeck(){
-  const deck = [];
-  COLORS.forEach(color=>{
-    deck.push({ id: cryptoId(), type: 'number', color, value: 0 });
-    for(let v=1; v<=9; v++){ deck.push({ id: cryptoId(), type: 'number', color, value: v }); deck.push({ id: cryptoId(), type: 'number', color, value: v }); }
-    for(let i=0;i<2;i++){ deck.push({ id: cryptoId(), type: 'skip', color }); deck.push({ id: cryptoId(), type: 'reverse', color }); deck.push({ id: cryptoId(), type: 'draw1', color }); deck.push({ id: cryptoId(), type: 'draw2', color }); }
+// Déck UNO simplifié
+function createDeck(){
+  const colors=['red','green','blue','yellow'];
+  const deck=[];
+  colors.forEach(color=>{
+    for(let i=0;i<=9;i++) deck.push({type:'number',color,value:i});
+    deck.push({type:'draw2',color},{type:'reverse',color},{type:'skip',color});
   });
-  for(let i=0;i<4;i++) deck.push({ id: cryptoId(), type: 'wild', color:'wild' });
-  for(let i=0;i<4;i++) deck.push({ id: cryptoId(), type: 'draw4', color:'wild' });
+  for(let i=0;i<4;i++) deck.push({type:'draw4',color:'wild'});
   return shuffle(deck);
 }
 
-let game = null;
+function shuffle(array){ return array.sort(()=>Math.random()-0.5); }
 
-function createGame(){
-  const deck = makeDeck();
-  let top = deck.shift();
-  while(top && top.type !== 'number'){ deck.push(top); top = deck.shift(); if(deck.length === 0) break; }
-  if(!top) top = { id: cryptoId(), type:'number', color:'red', value:0 };
-  return { deck, discard:[top], players:[], currentIndex:0, direction:1, pendingDraw:0, topCard:top };
-}
-if(!game) game = createGame();
+let game = {
+  players: [],
+  drawDeck: [],
+  discardDeck: [],
+  currentIndex:0,
+  direction:1
+};
 
-function reshuffleIfNeeded(){
-  if(game.deck.length === 0){
-    const keep = game.discard.splice(game.discard.length-1, 1);
-    game.deck.push(...shuffle(game.discard));
-    game.discard = keep;
-  }
-}
-
-function nextIndex(step = 1){
-  const n = game.players.filter(p=>!p.isSpectator).length;
-  if(n === 0) return 0;
-  let idx = game.currentIndex;
-  let moved = 0;
-  while(moved < step){
-    idx = (idx + game.direction + game.players.length) % game.players.length;
-    if(!game.players[idx].isSpectator) moved++;
-  }
-  return idx;
-}
-
-function logAll(msg){ io.emit('log', msg); }
-
-function emitStateToAll(){
-  game.players.forEach(p => {
-    const payload = {
-      topCard: game.topCard,
-      drawDeckCount: game.deck.length,
-      currentPlayerId: game.players[game.currentIndex] ? game.players[game.currentIndex].id : null,
-      players: game.players.map(pp=>({
-        id: pp.id, nick: pp.nick, cardsCount: pp.hand.length,
-        cards: pp.id === p.id ? pp.hand : undefined,
-        isSpectator: pp.isSpectator || false,
-        hasCalledUno: pp.hasCalledUno || false
-      })),
-      pendingDraw: game.pendingDraw
-    };
-    io.to(p.id).emit('gameState', payload);
-  });
-}
-
-function removePlayerById(id){
-  const idx = game.players.findIndex(p=>p.id === id);
-  if(idx !== -1){ const nick = game.players[idx].nick; game.players.splice(idx,1); logAll(`${nick} s'est déconnecté.`); }
-  if(game.players.length === 0){ game = createGame(); logAll('Partie réinitialisée (plus de joueurs).'); }
-}
-
-function makeSpectator(playerId, reason){
-  const p = game.players.find(x=>x.id===playerId);
-  if(!p) return;
-  p.isSpectator = true;
-  p.hasCalledUno = false;
-  logAll(`${p.nick} devient spectateur (${reason}).`);
-}
-
-function checkEliminationsAndRestart(){
-  for(const p of game.players){
-    if(!p.isSpectator && p.hand.length > MAX_CARDS_LOSE) makeSpectator(p.id, `a dépassé ${MAX_CARDS_LOSE} cartes`);
-    if(!p.isSpectator && p.hand.length === 0) makeSpectator(p.id, 'a gagné (0 cartes)');
-  }
-  const active = game.players.filter(p=>!p.isSpectator);
-  if(active.length <= 1) restartGameAndRedeal();
-  else emitStateToAll();
-}
-
-function restartGameAndRedeal(){
-  const connected = game.players.slice();
-  game = createGame();
-  for(const old of connected){
-    const newPlayer = { id: old.id, nick: old.nick, hand: [], hasCalledUno:false, isSpectator:false };
-    for(let i=0;i<7;i++){ reshuffleIfNeeded(); newPlayer.hand.push(game.deck.shift()); }
-    game.players.push(newPlayer);
-  }
-  game.currentIndex = 0; game.direction = 1; game.pendingDraw = 0;
-  logAll('Nouvelle partie lancée et cartes redistribuées.');
-  emitStateToAll();
-}
-
-io.on('connection', socket => {
-  const nick = socket.handshake.auth?.nick || ('Joueur' + Math.floor(Math.random()*999));
-  socket.data.nick = nick;
-  removePlayerById(socket.id);
-
-  const player = { id: socket.id, nick, hand: [], hasCalledUno:false, isSpectator:false };
-  for(let i=0;i<7;i++){ reshuffleIfNeeded(); player.hand.push(game.deck.shift()); }
+// Ajouter un joueur
+function addPlayer(id){
+  const player={id,nick:'Joueur'+Math.floor(Math.random()*999),cards:[],isSpectator:false,hasCalledUno:false};
   game.players.push(player);
-  logAll(`${nick} a rejoint la partie (${game.players.length} joueurs).`);
-  emitStateToAll();
+  if(game.drawDeck.length===0) startGame();
+  return player;
+}
 
-  socket.on('playCard', payload => {
-    const meIdx = game.players.findIndex(p=>p.id===socket.id); if(meIdx === -1) return;
-    const me = game.players[meIdx]; if(me.isSpectator) return;
-    if(game.players[game.currentIndex].id !== socket.id) return;
+// Supprimer joueur
+function removePlayerById(id){
+  game.players=game.players.filter(p=>p.id!==id);
+  if(game.players.length>0 && game.currentIndex>=game.players.length) game.currentIndex=0;
+}
 
-    const idx = payload.cardIndex;
-    if(typeof idx !== 'number' || idx < 0 || idx >= me.hand.length) return;
+// Distribuer cartes
+function dealCards(player,count=7){
+  for(let i=0;i<count;i++){
+    if(game.drawDeck.length===0) reshuffleDiscard();
+    player.cards.push(game.drawDeck.pop());
+  }
+}
 
-    const card = me.hand[idx]; const top = game.topCard;
-    const sameColor = card.color === top.color;
-    const sameNumber = card.type==='number' && top.type==='number' && card.value===top.value;
-    const sameTypeSpecial = card.type === top.type && card.type!=='number';
-    const isWildOrDraw4 = card.type==='wild'||card.type==='draw4';
-    if(!(sameColor||sameNumber||sameTypeSpecial||isWildOrDraw4)) return;
+// Reshuffle si deck vide
+function reshuffleDiscard(){
+  if(game.discardDeck.length<=1) return;
+  const top = game.discardDeck.pop();
+  game.drawDeck=shuffle(game.discardDeck);
+  game.discardDeck=[top];
+}
 
-    if(me.hand.length === 1 && card.type!=='number') return;
+// État du jeu
+function getGameState(){
+  return {
+    players: game.players.map(p=>({id:p.id,nick:p.nick,cardsCount:p.cards.length,isSpectator:p.isSpectator})),
+    topCard: game.discardDeck[game.discardDeck.length-1] || {},
+    drawDeckCount: game.drawDeck.length,
+    currentPlayerId: game.players[game.currentIndex]?.id
+  };
+}
 
-    me.hand.splice(idx,1);
-    game.discard.push(card);
-    io.emit('cardPlayed',{ playerId: me.id, card });
+// Log à tous
+function logAll(msg){ io.emit('log',msg); }
 
-    if(card.type==='wild'||card.type==='draw4'){
-      const chosen = payload.chosenColor; if(!['red','green','blue','yellow'].includes(chosen)) return;
-      game.topCard = { ...card, color: chosen };
-    } else game.topCard = card;
+// Vérifier éliminations et restart
+function checkEliminationsAndRestart(){
+  game.players.forEach(p=>{
+    if(!p.isSpectator && p.cards.length>35){
+      p.isSpectator=true;
+      logAll(`${p.nick} perd (plus de 35 cartes)`);
+    }
+  });
+  const active = game.players.filter(p=>!p.isSpectator);
+  if(active.length<=1){
+    logAll(`Redémarrage partie...`);
+    game.drawDeck=createDeck();
+    game.discardDeck=[];
+    game.players.forEach(p=>{
+      p.cards=[];
+      p.isSpectator=false;
+      dealCards(p);
+    });
+    game.currentIndex=0;
+    game.direction=1;
+    io.emit('gameState', getGameState());
+  }
+}
 
-    if(me.hand.length===1) me.hasCalledUno=false;
-    let advance=1;
-    if(card.type==='reverse') game.direction*=-1;
-    else if(card.type==='skip') advance=2;
-    else if(card.type==='draw1') game.pendingDraw+=1;
-    else if(card.type==='draw2') game.pendingDraw+=2;
-    else if(card.type==='draw4') game.pendingDraw+=4;
+// Démarrer partie
+function startGame(){
+  game.drawDeck=createDeck();
+  game.discardDeck=[game.drawDeck.pop()];
+  game.players.forEach(dealCards);
+  game.currentIndex=0;
+  game.direction=1;
+  io.emit('gameState', getGameState());
+}
 
-    checkEliminationsAndRestart();
-    game.currentIndex = nextIndex(advance);
-    emitStateToAll();
+// Jouer carte
+function playCard(playerId, index, chosenColor){
+  const player = game.players.find(p=>p.id===playerId);
+  if(!player || player.isSpectator) return;
+  const card = player.cards[index];
+  if(!card) return;
+
+  // Vérifier validité simple
+  const top = game.discardDeck[game.discardDeck.length-1];
+  if(card.color!==top.color && card.type!==top.type && card.color!=='wild') return;
+
+  // Ne pas finir sur +2/+4
+  if(player.cards.length===1 && (card.type==='draw2'||card.type==='draw4')) return;
+
+  player.cards.splice(index,1);
+  if(card.type==='wild' || card.type==='draw4') card.color=chosenColor;
+  game.discardDeck.push(card);
+  io.emit('cardPlayed',{playerId,card});
+  logAll(`${player.nick} joue ${card.type} (${card.color})`);
+
+  // Appliquer effets
+  if(card.type==='reverse') game.direction*=-1;
+  if(card.type==='skip') game.currentIndex = (game.currentIndex+game.direction+game.players.length)%game.players.length;
+  if(card.type==='draw2' || card.type==='draw4'){
+    const nextIndex = (game.currentIndex+game.direction+game.players.length)%game.players.length;
+    const nextPlayer = game.players[nextIndex];
+    const drawCount = card.type==='draw2'?2:4;
+    for(let i=0;i<drawCount;i++) dealCards(nextPlayer,1);
+    logAll(`${nextPlayer.nick} pioche ${drawCount} cartes !`);
+  }
+
+  game.currentIndex = (game.currentIndex+game.direction+game.players.length)%game.players.length;
+  io.emit('gameState', getGameState());
+  checkEliminationsAndRestart();
+}
+
+// Pioche
+function drawOne(playerId){
+  const player = game.players.find(p=>p.id===playerId);
+  if(!player || player.isSpectator) return;
+  if(game.drawDeck.length===0) reshuffleDiscard();
+  if(game.drawDeck.length===0) return;
+  const card = game.drawDeck.pop();
+  player.cards.push(card);
+  io.emit('cardDrawn',{playerId,card});
+  logAll(`${player.nick} pioche une carte`);
+  checkEliminationsAndRestart();
+}
+
+io.on('connection', socket=>{
+  const player = addPlayer(socket.id);
+  dealCards(player);
+  socket.emit('gameState', getGameState());
+  logAll(`${player.nick} rejoint la partie`);
+
+  socket.on('setNick', ({nick})=>{
+    player.nick=nick;
+    logAll(`${player.id} définit son pseudo à ${nick}`);
+    io.emit('gameState', getGameState());
   });
 
-  socket.on('drawOne', () => {
-    const meIdx = game.players.findIndex(p=>p.id===socket.id); if(meIdx === -1) return;
-    const me = game.players[meIdx]; if(me.isSpectator) return;
-    if(game.players[game.currentIndex].id !== socket.id) return;
-
-    const amt = game.pendingDraw>0?game.pendingDraw:1;
-    for(let i=0;i<amt;i++){ reshuffleIfNeeded(); const c=game.deck.shift(); me.hand.push(c); io.emit('cardDrawn',{ playerId: me.id, card:c }); }
-    game.pendingDraw = 0;
-    game.currentIndex = nextIndex(1);
-    checkEliminationsAndRestart();
+  socket.on('playCard', ({cardIndex, chosenColor})=>{
+    playCard(socket.id, cardIndex, chosenColor);
   });
 
-  socket.on('callUno', () => {
-    const me = game.players.find(p=>p.id===socket.id); if(!me || me.isSpectator) return;
-    if(me.hand.length===1){ me.hasCalledUno=true; logAll(`${me.nick} dit UNO !`); emitStateToAll(); }
-  });
+  socket.on('drawOne', ()=>{ drawOne(socket.id); });
 
-  socket.on('counterUno', ({ targetId }) => {
-    const target = game.players.find(p=>p.id===targetId); if(!target) return;
-    if(target.hand.length===1 && !target.hasCalledUno){
-      for(let i=0;i<2;i++){ reshuffleIfNeeded(); const c=game.deck.shift(); target.hand.push(c); io.emit('cardDrawn',{ playerId: target.id, card:c }); }
-      logAll(`${socket.data.nick} fait contre-UNO sur ${target.nick}`);
-      checkEliminationsAndRestart();
+  socket.on('callUno', ()=>{ logAll(`${player.nick} dit UNO !`); });
+
+  socket.on('disconnect', ()=>{
+    removePlayerById(socket.id);
+    io.emit('gameState', getGameState());
+    logAll(`${player.nick} quitte la partie`);
+  });
+});
+
+// Bots automatiques (se déconnectent dès 2 joueurs humains)
+setInterval(()=>{
+  const humanPlayers = game.players.filter(p=>!p.isSpectator && !p.id.startsWith('bot'));
+
+  // Ajouter bot si moins de 2 joueurs humains
+  if(humanPlayers.length < 2){
+    const botId='bot'+Math.floor(Math.random()*999);
+    addPlayer(botId);
+    logAll(`Bot ${botId} rejoint pour test`);
+  }
+
+  // Supprimer bots si 2+ joueurs humains
+  if(humanPlayers.length >= 2){
+    const bots = game.players.filter(p=>p.id.startsWith('bot'));
+    bots.forEach(bot=>{
+      removePlayerById(bot.id);
+      logAll(`Bot ${bot.nick} quitte car 2+ joueurs humains`);
+    });
+  }
+
+  // Tour des bots
+  game.players.filter(p=>p.id.startsWith('bot')).forEach(bot=>{
+    if(game.players[game.currentIndex].id===bot.id){
+      if(bot.cards.length>0){
+        playCard(bot.id, Math.floor(Math.random()*bot.cards.length), bot.cards[0].color);
+      } else {
+        drawOne(bot.id);
+      }
     }
   });
 
-  socket.on('disconnect', () => { removePlayerById(socket.id); if(game.players.length>0 && game.currentIndex>=game.players.length) game.currentIndex=0; emitStateToAll(); });
-});
+},1500);
 
-server.listen(PORT,()=>console.log('UNO server listening on',PORT));
+server.listen(PORT, ()=>console.log('UNO server listening on',PORT));
